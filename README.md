@@ -6,6 +6,8 @@ A programming language optimized for LLM authoring that compiles to native macOS
 
 Even though this isn't C code, the compiler does generate C internally as an intermediate step. This is an LLM — it specializes in text-based, readable input because that's what it's trained on. It's not going to emit raw bytecode or hand-tuned assembly efficiently. If you wanted a more efficient language, you shouldn't be using an LLM to write it. The point of Laze is to be the language that an LLM can produce the most correct, bug-free code in, as fast as possible. Minimal punctuation, no ambiguity, and direct access to system libraries.
 
+Also... who in their right mind would make a single `nes.laze` file that is 2000+ lines of code... guess the AI will! I didn't ask it to split files, so maybe it needs some additional work.
+
 ## Quick Start
 
 ```bash
