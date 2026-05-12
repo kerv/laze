@@ -4,7 +4,9 @@
 
 📝 [LinkedIn Post](https://www.linkedin.com/posts/millerkev_this-weekend-i-asked-ai-to-create-its-own-activity-7459608212556681216-Et-Q?utm_source=share&utm_medium=member_desktop&rcm=ACoAAANNr7sBw8clfttTTZe8qIzMSOLIB6wnxVo)
 
-![Laze NES Emulator](screenshot.png)
+<p align="center">
+  <img src="screenshot.png" alt="Laze NES Emulator" width="600">
+</p>
 
 A programming language optimized for LLM authoring that compiles to native macOS binaries. Indentation-based, minimal punctuation, infix operators.
 
