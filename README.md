@@ -1,5 +1,9 @@
 # Laze — LLM-Authored Zero Effort
 
+> ⚠️ **Warning:** This was just an experiment in which I asked Claude Opus 4 to create a programming language in the most efficient way it could. It isn't meant to be a serious thing — just a fun weekend project exploring what happens when you let an LLM design its own language.
+
+📝 [LinkedIn Post](https://www.linkedin.com/posts/millerkev_this-weekend-i-asked-ai-to-create-its-own-activity-7459608212556681216-Et-Q?utm_source=share&utm_medium=member_desktop&rcm=ACoAAANNr7sBw8clfttTTZe8qIzMSOLIB6wnxVo)
+
 A programming language optimized for LLM authoring that compiles to native macOS binaries. Indentation-based, minimal punctuation, infix operators.
 
 ## Thoughts
