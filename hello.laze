@@ -1,0 +1,8 @@
+; Hello World in Laze
+extern _write
+extern _exit
+
+fn main()
+  msg := "Hello, world!\n"
+  write(1, msg, 14)
+  exit(0)

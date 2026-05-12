@@ -1,0 +1,2360 @@
+; NES Emulator in Laze
+; Uses SDL2 for display, standard libc for file I/O
+
+link SDL2
+linkpath /opt/homebrew/lib
+
+extern _SDL_Init
+extern _SDL_CreateWindow
+extern _SDL_CreateRenderer
+extern _SDL_CreateTexture
+extern _SDL_PollEvent
+extern _SDL_RenderClear
+extern _SDL_RenderCopy
+extern _SDL_RenderPresent
+extern _SDL_UpdateTexture
+extern _SDL_DestroyWindow
+extern _SDL_DestroyRenderer
+extern _SDL_DestroyTexture
+extern _SDL_Quit
+extern _SDL_GetKeyboardState
+extern _SDL_Delay
+extern _SDL_OpenAudioDevice
+extern _SDL_PauseAudioDevice
+extern _SDL_CloseAudioDevice
+extern _SDL_QueueAudio
+extern _malloc
+extern _free
+extern _memset
+extern _memcpy
+extern _open
+extern _read
+extern _close
+extern _write
+extern _exit
+extern _printf
+extern _lseek
+
+; Memory layout offsets (all in one big allocation)
+; 0x0000 - 0x07FF: CPU RAM (2KB)
+; 0x0800 - 0x08FF: OAM (256 bytes)
+; 0x0900 - 0x091F: Palette (32 bytes)
+; 0x0920 - 0x0926: CPU regs (PC lo, PC hi, A, X, Y, SP, Flags)
+; 0x0930 - 0x093F: PPU regs (ctrl, mask, status, oamaddr, scroll_x, scroll_y, vram_addr lo, vram_addr hi, write_toggle, ppu_data_buf)
+; 0x0940 - 0x0947: Controller state (bits for pad 1)
+; 0x0948 - 0x094F: Controller latch
+; 0x0950 - 0x0957: PRG size (in 16K units)
+; 0x0958 - 0x095F: CHR size (in 8K units)
+; 0x0960 - 0x0967: Mirror mode
+; 0x0968 - 0x096F: Mapper number
+; 0x1000 - 0x1FFF: VRAM/Nametables (4KB)
+; 0x2000 - 0x9FFF: PRG ROM (32KB)
+; 0xA000 - 0xBFFF: CHR ROM (8KB)
+; 0xC000 - 0xFFFF: Framebuffer (256*240*4 = 245760 bytes) - separate alloc
+
+; SDL constants
+; SDL_INIT_VIDEO = 0x20
+; SDL_WINDOW_SHOWN = 0x04
+; SDL_PIXELFORMAT_ARGB8888 = 0x16362004
+; SDL_TEXTUREACCESS_STREAMING = 1
+; SDL_SCANCODE_UP = 82, DOWN = 81, LEFT = 80, RIGHT = 79
+; SDL_SCANCODE_Z = 29, X = 27, RETURN = 40, LSHIFT = 225
+; SDL_QUIT event = 0x100
+
+fn cpu_read(mem: ptr, addr: u64) -> u64
+  if addr < 0x2000
+    return mem[addr & 0x7FF]
+  end
+  if addr < 0x4000
+    return ppu_reg_read(mem, addr & 7)
+  end
+  if addr == 0x4016
+    return ctrl_read(mem)
+  end
+  if addr >= 0x6000
+    if addr < 0x8000
+      return mem[0xC000 + (addr - 0x6000)]
+    end
+  end
+  if addr >= 0x8000
+    mapper := mem[0x0968]
+    if mapper == 0
+      off := addr - 0x8000
+      prg_size := mem[0x0950]
+      if prg_size == 1
+        off = off & 0x3FFF
+      end
+      return mem[0x10000 + off]
+    end
+    if mapper == 1
+      return mmc1_read(mem, addr)
+    end
+    if mapper == 4
+      return mmc3_read(mem, addr)
+    end
+    ; Fallback: treat as mapper 0
+    off := addr - 0x8000
+    return mem[0x10000 + off]
+  end
+  return 0
+
+fn cpu_write(mem: ptr, addr: u64, val: u64)
+  if addr < 0x2000
+    mem[addr & 0x7FF] = val
+    return
+  end
+  if addr < 0x4000
+    ppu_reg_write(mem, addr & 7, val)
+    return
+  end
+  if addr == 0x4014
+    oam_dma(mem, val)
+    return
+  end
+  if addr == 0x4016
+    ctrl_write(mem, val)
+    return
+  end
+  if addr >= 0x4000
+    if addr <= 0x4015
+      apu_write(mem, addr, val)
+    end
+  end
+  if addr >= 0x6000
+    if addr < 0x8000
+      ; PRG RAM (save RAM)
+      mem[0xC000 + (addr - 0x6000)] = val
+      return
+    end
+  end
+  if addr >= 0x8000
+    mapper_write(mem, addr, val)
+  end
+  return
+
+fn ppu_reg_read(mem: ptr, reg: u64) -> u64
+  if reg == 2
+    status := mem[0x0932]
+    mem[0x0932] = status & 0x7F
+    mem[0x0938] = 0
+    return status
+  end
+  if reg == 7
+    addr_lo := mem[0x0936]
+    addr_hi := mem[0x0937]
+    addr := (addr_hi << 8) | addr_lo
+    buf := mem[0x0939]
+    result := vram_read(mem, addr)
+    if addr < 0x3F00
+      mem[0x0939] = result
+      result = buf
+    end
+    inc := 1
+    if mem[0x0930] & 4
+      inc = 32
+    end
+    addr = addr + inc
+    mem[0x0936] = addr & 0xFF
+    mem[0x0937] = (addr >> 8) & 0x3F
+    return result
+  end
+  return 0
+
+fn ppu_reg_write(mem: ptr, reg: u64, val: u64)
+  if reg == 0
+    mem[0x0930] = val
+    return
+  end
+  if reg == 1
+    mem[0x0931] = val
+    return
+  end
+  if reg == 3
+    mem[0x0933] = val
+    return
+  end
+  if reg == 4
+    oam_addr := mem[0x0933]
+    mem[0x0800 + oam_addr] = val
+    mem[0x0933] = (oam_addr + 1) & 0xFF
+    return
+  end
+  if reg == 5
+    if mem[0x0938] == 0
+      mem[0x0934] = val
+      mem[0x0938] = 1
+    else
+      mem[0x0935] = val
+      mem[0x0938] = 0
+    end
+    return
+  end
+  if reg == 6
+    if mem[0x0938] == 0
+      mem[0x0937] = val & 0x3F
+      mem[0x0938] = 1
+    else
+      mem[0x0936] = val
+      mem[0x0938] = 0
+    end
+    return
+  end
+  if reg == 7
+    addr_lo := mem[0x0936]
+    addr_hi := mem[0x0937]
+    addr := (addr_hi << 8) | addr_lo
+    vram_write(mem, addr, val)
+    inc := 1
+    if mem[0x0930] & 4
+      inc = 32
+    end
+    addr = addr + inc
+    mem[0x0936] = addr & 0xFF
+    mem[0x0937] = (addr >> 8) & 0x3F
+    return
+  end
+  return
+
+fn vram_read(mem: ptr, addr: u64) -> u64
+  a := addr & 0x3FFF
+  if a < 0x2000
+    return mem[0xA000 + a]
+  end
+  if a >= 0x3F00
+    idx := a & 0x1F
+    if (idx & 0x13) == 0x10
+      idx = idx & 0x0F
+    end
+    return mem[0x0900 + idx]
+  end
+  nt := a & 0x0FFF
+  mirror := mem[0x0960]
+  if mirror == 0
+    if nt >= 0x0800
+      nt = nt - 0x0800
+    end
+    if nt >= 0x0400
+      nt = nt - 0x0400
+    end
+  end
+  if mirror == 1
+    nt = nt & 0x07FF
+  end
+  if mirror == 2
+    nt = nt & 0x03FF
+  end
+  if mirror == 3
+    nt = (nt & 0x03FF) + 0x0400
+  end
+  return mem[0x1000 + nt]
+
+fn vram_write(mem: ptr, addr: u64, val: u64)
+  a := addr & 0x3FFF
+  if a < 0x2000
+    ; CHR RAM write (for games with 0 CHR banks)
+    mem[0xA000 + a] = val
+    return
+  end
+  if a >= 0x3F00
+    idx := a & 0x1F
+    if (idx & 0x13) == 0x10
+      idx = idx & 0x0F
+    end
+    mem[0x0900 + idx] = val
+    return
+  end
+  nt := a & 0x0FFF
+  mirror := mem[0x0960]
+  if mirror == 0
+    if nt >= 0x0800
+      nt = nt - 0x0800
+    end
+    if nt >= 0x0400
+      nt = nt - 0x0400
+    end
+  end
+  if mirror == 1
+    nt = nt & 0x07FF
+  end
+  if mirror == 2
+    nt = nt & 0x03FF
+  end
+  if mirror == 3
+    nt = (nt & 0x03FF) + 0x0400
+  end
+  mem[0x1000 + nt] = val
+  return
+
+fn oam_dma(mem: ptr, page: u64)
+  base := page << 8
+  i := 0
+  while i < 256
+    v := cpu_read(mem, base + i)
+    mem[0x0800 + i] = v
+    i = i + 1
+  end
+  return
+
+fn ctrl_read(mem: ptr) -> u64
+  v := mem[0x0948] & 1
+  mem[0x0948] = (mem[0x0948] >> 1) | 0x80
+  return v
+
+fn ctrl_write(mem: ptr, val: u64)
+  if val & 1
+    mem[0x0948] = mem[0x0940]
+  end
+  return
+
+; === CPU Core ===
+fn get_pc(mem: ptr) -> u64
+  lo := mem[0x0920]
+  hi := mem[0x0921]
+  return (hi << 8) | lo
+
+fn set_pc(mem: ptr, val: u64)
+  mem[0x0920] = val & 0xFF
+  mem[0x0921] = (val >> 8) & 0xFF
+  return
+
+fn push8(mem: ptr, val: u64)
+  sp := mem[0x0925]
+  mem[0x0100 + sp] = val & 0xFF
+  mem[0x0925] = (sp - 1) & 0xFF
+  return
+
+fn pull8(mem: ptr) -> u64
+  sp := (mem[0x0925] + 1) & 0xFF
+  mem[0x0925] = sp
+  return mem[0x0100 + sp]
+
+fn push16(mem: ptr, val: u64)
+  push8(mem, (val >> 8) & 0xFF)
+  push8(mem, val & 0xFF)
+  return
+
+fn pull16(mem: ptr) -> u64
+  lo := pull8(mem)
+  hi := pull8(mem)
+  return (hi << 8) | lo
+
+fn set_nz(mem: ptr, val: u64)
+  f := mem[0x0926] & 0x7D
+  if (val & 0xFF) == 0
+    f = f | 0x02
+  end
+  f = f | (val & 0x80)
+  mem[0x0926] = f
+  return
+
+fn fetch(mem: ptr) -> u64
+  pc := get_pc(mem)
+  v := cpu_read(mem, pc)
+  set_pc(mem, pc + 1)
+  return v
+
+fn fetch16(mem: ptr) -> u64
+  lo := fetch(mem)
+  hi := fetch(mem)
+  return (hi << 8) | lo
+
+fn do_adc(mem: ptr, val: u64)
+  a := mem[0x0922]
+  f := mem[0x0926]
+  c := f & 1
+  s := a + val + c
+  f = f & 0x3C
+  if s >= 256
+    f = f | 0x01
+  end
+  r := s & 0xFF
+  if r == 0
+    f = f | 0x02
+  end
+  f = f | (r & 0x80)
+  ov := (a ^ r) & (val ^ r) & 0x80
+  if ov
+    f = f | 0x40
+  end
+  mem[0x0922] = r
+  mem[0x0926] = f
+  return
+
+fn do_sbc(mem: ptr, val: u64)
+  do_adc(mem, val ^ 0xFF)
+  return
+
+fn do_cmp(mem: ptr, rv: u64, val: u64)
+  diff := rv - val
+  f := mem[0x0926] & 0x7C
+  if rv >= val
+    f = f | 0x01
+  end
+  if (diff & 0xFF) == 0
+    f = f | 0x02
+  end
+  f = f | (diff & 0x80)
+  mem[0x0926] = f
+  return
+
+fn addr_zp(mem: ptr) -> u64
+  return fetch(mem)
+
+fn addr_zpx(mem: ptr) -> u64
+  return (fetch(mem) + mem[0x0923]) & 0xFF
+
+fn addr_zpy(mem: ptr) -> u64
+  return (fetch(mem) + mem[0x0924]) & 0xFF
+
+fn addr_abs(mem: ptr) -> u64
+  return fetch16(mem)
+
+fn addr_absx(mem: ptr) -> u64
+  return (fetch16(mem) + mem[0x0923]) & 0xFFFF
+
+fn addr_absy(mem: ptr) -> u64
+  return (fetch16(mem) + mem[0x0924]) & 0xFFFF
+
+fn addr_indx(mem: ptr) -> u64
+  zp := (fetch(mem) + mem[0x0923]) & 0xFF
+  lo := cpu_read(mem, zp)
+  hi := cpu_read(mem, (zp + 1) & 0xFF)
+  return (hi << 8) | lo
+
+fn addr_indy(mem: ptr) -> u64
+  zp := fetch(mem)
+  lo := cpu_read(mem, zp)
+  hi := cpu_read(mem, (zp + 1) & 0xFF)
+  base := (hi << 8) | lo
+  return (base + mem[0x0924]) & 0xFFFF
+
+; === CPU Step ===
+fn cpu_step(mem: ptr) -> u64
+  op := fetch(mem)
+  ; LDA
+  if op == 0xA9
+    mem[0x0922] = fetch(mem)
+    set_nz(mem, mem[0x0922])
+    return 2
+  end
+  if op == 0xA5
+    mem[0x0922] = cpu_read(mem, addr_zp(mem))
+    set_nz(mem, mem[0x0922])
+    return 3
+  end
+  if op == 0xB5
+    mem[0x0922] = cpu_read(mem, addr_zpx(mem))
+    set_nz(mem, mem[0x0922])
+    return 4
+  end
+  if op == 0xAD
+    mem[0x0922] = cpu_read(mem, addr_abs(mem))
+    set_nz(mem, mem[0x0922])
+    return 4
+  end
+  if op == 0xBD
+    mem[0x0922] = cpu_read(mem, addr_absx(mem))
+    set_nz(mem, mem[0x0922])
+    return 4
+  end
+  if op == 0xB9
+    mem[0x0922] = cpu_read(mem, addr_absy(mem))
+    set_nz(mem, mem[0x0922])
+    return 4
+  end
+  if op == 0xA1
+    mem[0x0922] = cpu_read(mem, addr_indx(mem))
+    set_nz(mem, mem[0x0922])
+    return 6
+  end
+  if op == 0xB1
+    mem[0x0922] = cpu_read(mem, addr_indy(mem))
+    set_nz(mem, mem[0x0922])
+    return 5
+  end
+  ; LDX
+  if op == 0xA2
+    mem[0x0923] = fetch(mem)
+    set_nz(mem, mem[0x0923])
+    return 2
+  end
+  if op == 0xA6
+    mem[0x0923] = cpu_read(mem, addr_zp(mem))
+    set_nz(mem, mem[0x0923])
+    return 3
+  end
+  if op == 0xB6
+    mem[0x0923] = cpu_read(mem, addr_zpy(mem))
+    set_nz(mem, mem[0x0923])
+    return 4
+  end
+  if op == 0xAE
+    mem[0x0923] = cpu_read(mem, addr_abs(mem))
+    set_nz(mem, mem[0x0923])
+    return 4
+  end
+  if op == 0xBE
+    mem[0x0923] = cpu_read(mem, addr_absy(mem))
+    set_nz(mem, mem[0x0923])
+    return 4
+  end
+  ; LDY
+  if op == 0xA0
+    mem[0x0924] = fetch(mem)
+    set_nz(mem, mem[0x0924])
+    return 2
+  end
+  if op == 0xA4
+    mem[0x0924] = cpu_read(mem, addr_zp(mem))
+    set_nz(mem, mem[0x0924])
+    return 3
+  end
+  if op == 0xB4
+    mem[0x0924] = cpu_read(mem, addr_zpx(mem))
+    set_nz(mem, mem[0x0924])
+    return 4
+  end
+  if op == 0xAC
+    mem[0x0924] = cpu_read(mem, addr_abs(mem))
+    set_nz(mem, mem[0x0924])
+    return 4
+  end
+  if op == 0xBC
+    mem[0x0924] = cpu_read(mem, addr_absx(mem))
+    set_nz(mem, mem[0x0924])
+    return 4
+  end
+  ; STA
+  if op == 0x85
+    cpu_write(mem, addr_zp(mem), mem[0x0922])
+    return 3
+  end
+  if op == 0x95
+    cpu_write(mem, addr_zpx(mem), mem[0x0922])
+    return 4
+  end
+  if op == 0x8D
+    cpu_write(mem, addr_abs(mem), mem[0x0922])
+    return 4
+  end
+  if op == 0x9D
+    cpu_write(mem, addr_absx(mem), mem[0x0922])
+    return 5
+  end
+  if op == 0x99
+    cpu_write(mem, addr_absy(mem), mem[0x0922])
+    return 5
+  end
+  if op == 0x81
+    cpu_write(mem, addr_indx(mem), mem[0x0922])
+    return 6
+  end
+  if op == 0x91
+    cpu_write(mem, addr_indy(mem), mem[0x0922])
+    return 6
+  end
+  ; STX
+  if op == 0x86
+    cpu_write(mem, addr_zp(mem), mem[0x0923])
+    return 3
+  end
+  if op == 0x8E
+    cpu_write(mem, addr_abs(mem), mem[0x0923])
+    return 4
+  end
+  if op == 0x96
+    cpu_write(mem, addr_zpy(mem), mem[0x0923])
+    return 4
+  end
+  ; STY
+  if op == 0x84
+    cpu_write(mem, addr_zp(mem), mem[0x0924])
+    return 3
+  end
+  if op == 0x8C
+    cpu_write(mem, addr_abs(mem), mem[0x0924])
+    return 4
+  end
+  if op == 0x94
+    cpu_write(mem, addr_zpx(mem), mem[0x0924])
+    return 4
+  end
+  return cpu_step2(mem, op)
+
+fn cpu_step2(mem: ptr, op: u64) -> u64
+  ; Transfers
+  if op == 0xAA
+    mem[0x0923] = mem[0x0922]
+    set_nz(mem, mem[0x0923])
+    return 2
+  end
+  if op == 0xA8
+    mem[0x0924] = mem[0x0922]
+    set_nz(mem, mem[0x0924])
+    return 2
+  end
+  if op == 0x8A
+    mem[0x0922] = mem[0x0923]
+    set_nz(mem, mem[0x0922])
+    return 2
+  end
+  if op == 0x98
+    mem[0x0922] = mem[0x0924]
+    set_nz(mem, mem[0x0922])
+    return 2
+  end
+  if op == 0xBA
+    mem[0x0923] = mem[0x0925]
+    set_nz(mem, mem[0x0923])
+    return 2
+  end
+  if op == 0x9A
+    mem[0x0925] = mem[0x0923]
+    return 2
+  end
+  ; Stack
+  if op == 0x48
+    push8(mem, mem[0x0922])
+    return 3
+  end
+  if op == 0x08
+    push8(mem, mem[0x0926] | 0x30)
+    return 3
+  end
+  if op == 0x68
+    mem[0x0922] = pull8(mem)
+    set_nz(mem, mem[0x0922])
+    return 4
+  end
+  if op == 0x28
+    mem[0x0926] = (pull8(mem) & 0xEF) | 0x20
+    return 4
+  end
+  ; Flags
+  if op == 0x18
+    mem[0x0926] = mem[0x0926] & 0xFE
+    return 2
+  end
+  if op == 0x38
+    mem[0x0926] = mem[0x0926] | 0x01
+    return 2
+  end
+  if op == 0x58
+    mem[0x0926] = mem[0x0926] & 0xFB
+    return 2
+  end
+  if op == 0x78
+    mem[0x0926] = mem[0x0926] | 0x04
+    return 2
+  end
+  if op == 0xD8
+    mem[0x0926] = mem[0x0926] & 0xF7
+    return 2
+  end
+  if op == 0xF8
+    mem[0x0926] = mem[0x0926] | 0x08
+    return 2
+  end
+  if op == 0xB8
+    mem[0x0926] = mem[0x0926] & 0xBF
+    return 2
+  end
+  ; INC/DEC register
+  if op == 0xE8
+    mem[0x0923] = (mem[0x0923] + 1) & 0xFF
+    set_nz(mem, mem[0x0923])
+    return 2
+  end
+  if op == 0xC8
+    mem[0x0924] = (mem[0x0924] + 1) & 0xFF
+    set_nz(mem, mem[0x0924])
+    return 2
+  end
+  if op == 0xCA
+    mem[0x0923] = (mem[0x0923] - 1) & 0xFF
+    set_nz(mem, mem[0x0923])
+    return 2
+  end
+  if op == 0x88
+    mem[0x0924] = (mem[0x0924] - 1) & 0xFF
+    set_nz(mem, mem[0x0924])
+    return 2
+  end
+  ; Branches
+  if op == 0x10
+    return do_branch(mem, (mem[0x0926] & 0x80) == 0)
+  end
+  if op == 0x30
+    return do_branch(mem, (mem[0x0926] & 0x80) != 0)
+  end
+  if op == 0x50
+    return do_branch(mem, (mem[0x0926] & 0x40) == 0)
+  end
+  if op == 0x70
+    return do_branch(mem, (mem[0x0926] & 0x40) != 0)
+  end
+  if op == 0x90
+    return do_branch(mem, (mem[0x0926] & 0x01) == 0)
+  end
+  if op == 0xB0
+    return do_branch(mem, (mem[0x0926] & 0x01) != 0)
+  end
+  if op == 0xD0
+    return do_branch(mem, (mem[0x0926] & 0x02) == 0)
+  end
+  if op == 0xF0
+    return do_branch(mem, (mem[0x0926] & 0x02) != 0)
+  end
+  ; Jumps
+  if op == 0x4C
+    set_pc(mem, fetch16(mem))
+    return 3
+  end
+  if op == 0x6C
+    addr := fetch16(mem)
+    lo := cpu_read(mem, addr)
+    hi_addr := (addr & 0xFF00) | ((addr + 1) & 0xFF)
+    hi := cpu_read(mem, hi_addr)
+    set_pc(mem, (hi << 8) | lo)
+    return 5
+  end
+  if op == 0x20
+    target := fetch16(mem)
+    push16(mem, get_pc(mem) - 1)
+    set_pc(mem, target)
+    return 6
+  end
+  if op == 0x60
+    set_pc(mem, pull16(mem) + 1)
+    return 6
+  end
+  if op == 0x40
+    mem[0x0926] = (pull8(mem) & 0xEF) | 0x20
+    set_pc(mem, pull16(mem))
+    return 6
+  end
+  if op == 0x00
+    pc := get_pc(mem) + 1
+    push16(mem, pc)
+    push8(mem, mem[0x0926] | 0x30)
+    mem[0x0926] = mem[0x0926] | 0x04
+    lo := cpu_read(mem, 0xFFFE)
+    hi := cpu_read(mem, 0xFFFF)
+    set_pc(mem, (hi << 8) | lo)
+    return 7
+  end
+  ; NOP
+  if op == 0xEA
+    return 2
+  end
+  return cpu_step3(mem, op)
+
+fn do_branch(mem: ptr, cond: u64) -> u64
+  off := fetch(mem)
+  if cond == 0
+    return 2
+  end
+  if off >= 128
+    off = off - 256
+  end
+  pc := get_pc(mem)
+  set_pc(mem, (pc + off) & 0xFFFF)
+  return 3
+
+fn cpu_step3(mem: ptr, op: u64) -> u64
+  ; ADC
+  if op == 0x69
+    do_adc(mem, fetch(mem))
+    return 2
+  end
+  if op == 0x65
+    do_adc(mem, cpu_read(mem, addr_zp(mem)))
+    return 3
+  end
+  if op == 0x75
+    do_adc(mem, cpu_read(mem, addr_zpx(mem)))
+    return 4
+  end
+  if op == 0x6D
+    do_adc(mem, cpu_read(mem, addr_abs(mem)))
+    return 4
+  end
+  if op == 0x7D
+    do_adc(mem, cpu_read(mem, addr_absx(mem)))
+    return 4
+  end
+  if op == 0x79
+    do_adc(mem, cpu_read(mem, addr_absy(mem)))
+    return 4
+  end
+  if op == 0x61
+    do_adc(mem, cpu_read(mem, addr_indx(mem)))
+    return 6
+  end
+  if op == 0x71
+    do_adc(mem, cpu_read(mem, addr_indy(mem)))
+    return 5
+  end
+  ; SBC
+  if op == 0xE9
+    do_sbc(mem, fetch(mem))
+    return 2
+  end
+  if op == 0xE5
+    do_sbc(mem, cpu_read(mem, addr_zp(mem)))
+    return 3
+  end
+  if op == 0xF5
+    do_sbc(mem, cpu_read(mem, addr_zpx(mem)))
+    return 4
+  end
+  if op == 0xED
+    do_sbc(mem, cpu_read(mem, addr_abs(mem)))
+    return 4
+  end
+  if op == 0xFD
+    do_sbc(mem, cpu_read(mem, addr_absx(mem)))
+    return 4
+  end
+  if op == 0xF9
+    do_sbc(mem, cpu_read(mem, addr_absy(mem)))
+    return 4
+  end
+  if op == 0xE1
+    do_sbc(mem, cpu_read(mem, addr_indx(mem)))
+    return 6
+  end
+  if op == 0xF1
+    do_sbc(mem, cpu_read(mem, addr_indy(mem)))
+    return 5
+  end
+  ; ORA
+  if op == 0x09
+    mem[0x0922] = mem[0x0922] | fetch(mem)
+    set_nz(mem, mem[0x0922])
+    return 2
+  end
+  if op == 0x05
+    mem[0x0922] = mem[0x0922] | cpu_read(mem, addr_zp(mem))
+    set_nz(mem, mem[0x0922])
+    return 3
+  end
+  if op == 0x15
+    mem[0x0922] = mem[0x0922] | cpu_read(mem, addr_zpx(mem))
+    set_nz(mem, mem[0x0922])
+    return 4
+  end
+  if op == 0x0D
+    mem[0x0922] = mem[0x0922] | cpu_read(mem, addr_abs(mem))
+    set_nz(mem, mem[0x0922])
+    return 4
+  end
+  if op == 0x1D
+    mem[0x0922] = mem[0x0922] | cpu_read(mem, addr_absx(mem))
+    set_nz(mem, mem[0x0922])
+    return 4
+  end
+  if op == 0x19
+    mem[0x0922] = mem[0x0922] | cpu_read(mem, addr_absy(mem))
+    set_nz(mem, mem[0x0922])
+    return 4
+  end
+  if op == 0x01
+    mem[0x0922] = mem[0x0922] | cpu_read(mem, addr_indx(mem))
+    set_nz(mem, mem[0x0922])
+    return 6
+  end
+  if op == 0x11
+    mem[0x0922] = mem[0x0922] | cpu_read(mem, addr_indy(mem))
+    set_nz(mem, mem[0x0922])
+    return 5
+  end
+  ; AND
+  if op == 0x29
+    mem[0x0922] = mem[0x0922] & fetch(mem)
+    set_nz(mem, mem[0x0922])
+    return 2
+  end
+  if op == 0x25
+    mem[0x0922] = mem[0x0922] & cpu_read(mem, addr_zp(mem))
+    set_nz(mem, mem[0x0922])
+    return 3
+  end
+  if op == 0x35
+    mem[0x0922] = mem[0x0922] & cpu_read(mem, addr_zpx(mem))
+    set_nz(mem, mem[0x0922])
+    return 4
+  end
+  if op == 0x2D
+    mem[0x0922] = mem[0x0922] & cpu_read(mem, addr_abs(mem))
+    set_nz(mem, mem[0x0922])
+    return 4
+  end
+  if op == 0x3D
+    mem[0x0922] = mem[0x0922] & cpu_read(mem, addr_absx(mem))
+    set_nz(mem, mem[0x0922])
+    return 4
+  end
+  if op == 0x39
+    mem[0x0922] = mem[0x0922] & cpu_read(mem, addr_absy(mem))
+    set_nz(mem, mem[0x0922])
+    return 4
+  end
+  if op == 0x21
+    mem[0x0922] = mem[0x0922] & cpu_read(mem, addr_indx(mem))
+    set_nz(mem, mem[0x0922])
+    return 6
+  end
+  if op == 0x31
+    mem[0x0922] = mem[0x0922] & cpu_read(mem, addr_indy(mem))
+    set_nz(mem, mem[0x0922])
+    return 5
+  end
+  ; EOR
+  if op == 0x49
+    mem[0x0922] = mem[0x0922] ^ fetch(mem)
+    set_nz(mem, mem[0x0922])
+    return 2
+  end
+  if op == 0x45
+    mem[0x0922] = mem[0x0922] ^ cpu_read(mem, addr_zp(mem))
+    set_nz(mem, mem[0x0922])
+    return 3
+  end
+  if op == 0x55
+    mem[0x0922] = mem[0x0922] ^ cpu_read(mem, addr_zpx(mem))
+    set_nz(mem, mem[0x0922])
+    return 4
+  end
+  if op == 0x4D
+    mem[0x0922] = mem[0x0922] ^ cpu_read(mem, addr_abs(mem))
+    set_nz(mem, mem[0x0922])
+    return 4
+  end
+  if op == 0x5D
+    mem[0x0922] = mem[0x0922] ^ cpu_read(mem, addr_absx(mem))
+    set_nz(mem, mem[0x0922])
+    return 4
+  end
+  if op == 0x59
+    mem[0x0922] = mem[0x0922] ^ cpu_read(mem, addr_absy(mem))
+    set_nz(mem, mem[0x0922])
+    return 4
+  end
+  return cpu_step4(mem, op)
+
+fn cpu_step4(mem: ptr, op: u64) -> u64
+  ; CMP
+  if op == 0xC9
+    do_cmp(mem, mem[0x0922], fetch(mem))
+    return 2
+  end
+  if op == 0xC5
+    do_cmp(mem, mem[0x0922], cpu_read(mem, addr_zp(mem)))
+    return 3
+  end
+  if op == 0xD5
+    do_cmp(mem, mem[0x0922], cpu_read(mem, addr_zpx(mem)))
+    return 4
+  end
+  if op == 0xCD
+    do_cmp(mem, mem[0x0922], cpu_read(mem, addr_abs(mem)))
+    return 4
+  end
+  if op == 0xDD
+    do_cmp(mem, mem[0x0922], cpu_read(mem, addr_absx(mem)))
+    return 4
+  end
+  if op == 0xD9
+    do_cmp(mem, mem[0x0922], cpu_read(mem, addr_absy(mem)))
+    return 4
+  end
+  if op == 0xC1
+    do_cmp(mem, mem[0x0922], cpu_read(mem, addr_indx(mem)))
+    return 6
+  end
+  if op == 0xD1
+    do_cmp(mem, mem[0x0922], cpu_read(mem, addr_indy(mem)))
+    return 5
+  end
+  ; CPX
+  if op == 0xE0
+    do_cmp(mem, mem[0x0923], fetch(mem))
+    return 2
+  end
+  if op == 0xE4
+    do_cmp(mem, mem[0x0923], cpu_read(mem, addr_zp(mem)))
+    return 3
+  end
+  if op == 0xEC
+    do_cmp(mem, mem[0x0923], cpu_read(mem, addr_abs(mem)))
+    return 4
+  end
+  ; CPY
+  if op == 0xC0
+    do_cmp(mem, mem[0x0924], fetch(mem))
+    return 2
+  end
+  if op == 0xC4
+    do_cmp(mem, mem[0x0924], cpu_read(mem, addr_zp(mem)))
+    return 3
+  end
+  if op == 0xCC
+    do_cmp(mem, mem[0x0924], cpu_read(mem, addr_abs(mem)))
+    return 4
+  end
+  ; INC mem
+  if op == 0xE6
+    a := addr_zp(mem)
+    v := (cpu_read(mem, a) + 1) & 0xFF
+    cpu_write(mem, a, v)
+    set_nz(mem, v)
+    return 5
+  end
+  if op == 0xF6
+    a := addr_zpx(mem)
+    v := (cpu_read(mem, a) + 1) & 0xFF
+    cpu_write(mem, a, v)
+    set_nz(mem, v)
+    return 6
+  end
+  if op == 0xEE
+    a := addr_abs(mem)
+    v := (cpu_read(mem, a) + 1) & 0xFF
+    cpu_write(mem, a, v)
+    set_nz(mem, v)
+    return 6
+  end
+  if op == 0xFE
+    a := addr_absx(mem)
+    v := (cpu_read(mem, a) + 1) & 0xFF
+    cpu_write(mem, a, v)
+    set_nz(mem, v)
+    return 7
+  end
+  ; DEC mem
+  if op == 0xC6
+    a := addr_zp(mem)
+    v := (cpu_read(mem, a) - 1) & 0xFF
+    cpu_write(mem, a, v)
+    set_nz(mem, v)
+    return 5
+  end
+  if op == 0xD6
+    a := addr_zpx(mem)
+    v := (cpu_read(mem, a) - 1) & 0xFF
+    cpu_write(mem, a, v)
+    set_nz(mem, v)
+    return 6
+  end
+  if op == 0xCE
+    a := addr_abs(mem)
+    v := (cpu_read(mem, a) - 1) & 0xFF
+    cpu_write(mem, a, v)
+    set_nz(mem, v)
+    return 6
+  end
+  if op == 0xDE
+    a := addr_absx(mem)
+    v := (cpu_read(mem, a) - 1) & 0xFF
+    cpu_write(mem, a, v)
+    set_nz(mem, v)
+    return 7
+  end
+  ; ASL A
+  if op == 0x0A
+    f := mem[0x0926] & 0xFE
+    a := mem[0x0922]
+    f = f | (a >> 7)
+    mem[0x0922] = (a << 1) & 0xFF
+    mem[0x0926] = f
+    set_nz(mem, mem[0x0922])
+    return 2
+  end
+  ; LSR A
+  if op == 0x4A
+    f := mem[0x0926] & 0xFE
+    a := mem[0x0922]
+    f = f | (a & 1)
+    mem[0x0922] = a >> 1
+    mem[0x0926] = f
+    set_nz(mem, mem[0x0922])
+    return 2
+  end
+  ; ROL A
+  if op == 0x2A
+    f := mem[0x0926]
+    c := f & 1
+    a := mem[0x0922]
+    f = (f & 0xFE) | (a >> 7)
+    mem[0x0922] = ((a << 1) | c) & 0xFF
+    mem[0x0926] = f
+    set_nz(mem, mem[0x0922])
+    return 2
+  end
+  ; ROR A
+  if op == 0x6A
+    f := mem[0x0926]
+    c := f & 1
+    a := mem[0x0922]
+    f = (f & 0xFE) | (a & 1)
+    mem[0x0922] = (a >> 1) | (c << 7)
+    mem[0x0926] = f
+    set_nz(mem, mem[0x0922])
+    return 2
+  end
+  ; BIT
+  if op == 0x24
+    v := cpu_read(mem, addr_zp(mem))
+    f := mem[0x0926] & 0x3D
+    if (mem[0x0922] & v) == 0
+      f = f | 0x02
+    end
+    f = f | (v & 0xC0)
+    mem[0x0926] = f
+    return 3
+  end
+  if op == 0x2C
+    v := cpu_read(mem, addr_abs(mem))
+    f := mem[0x0926] & 0x3D
+    if (mem[0x0922] & v) == 0
+      f = f | 0x02
+    end
+    f = f | (v & 0xC0)
+    mem[0x0926] = f
+    return 4
+  end
+  return cpu_step5(mem, op)
+
+fn cpu_step5(mem: ptr, op: u64) -> u64
+  ; ASL mem
+  if op == 0x06
+    a := addr_zp(mem)
+    v := cpu_read(mem, a)
+    f := (mem[0x0926] & 0xFE) | (v >> 7)
+    v = (v << 1) & 0xFF
+    cpu_write(mem, a, v)
+    mem[0x0926] = f
+    set_nz(mem, v)
+    return 5
+  end
+  if op == 0x16
+    a := addr_zpx(mem)
+    v := cpu_read(mem, a)
+    f := (mem[0x0926] & 0xFE) | (v >> 7)
+    v = (v << 1) & 0xFF
+    cpu_write(mem, a, v)
+    mem[0x0926] = f
+    set_nz(mem, v)
+    return 6
+  end
+  if op == 0x0E
+    a := addr_abs(mem)
+    v := cpu_read(mem, a)
+    f := (mem[0x0926] & 0xFE) | (v >> 7)
+    v = (v << 1) & 0xFF
+    cpu_write(mem, a, v)
+    mem[0x0926] = f
+    set_nz(mem, v)
+    return 6
+  end
+  if op == 0x1E
+    a := addr_absx(mem)
+    v := cpu_read(mem, a)
+    f := (mem[0x0926] & 0xFE) | (v >> 7)
+    v = (v << 1) & 0xFF
+    cpu_write(mem, a, v)
+    mem[0x0926] = f
+    set_nz(mem, v)
+    return 7
+  end
+  ; LSR mem
+  if op == 0x46
+    a := addr_zp(mem)
+    v := cpu_read(mem, a)
+    f := (mem[0x0926] & 0xFE) | (v & 1)
+    v = v >> 1
+    cpu_write(mem, a, v)
+    mem[0x0926] = f
+    set_nz(mem, v)
+    return 5
+  end
+  if op == 0x56
+    a := addr_zpx(mem)
+    v := cpu_read(mem, a)
+    f := (mem[0x0926] & 0xFE) | (v & 1)
+    v = v >> 1
+    cpu_write(mem, a, v)
+    mem[0x0926] = f
+    set_nz(mem, v)
+    return 6
+  end
+  if op == 0x4E
+    a := addr_abs(mem)
+    v := cpu_read(mem, a)
+    f := (mem[0x0926] & 0xFE) | (v & 1)
+    v = v >> 1
+    cpu_write(mem, a, v)
+    mem[0x0926] = f
+    set_nz(mem, v)
+    return 6
+  end
+  if op == 0x5E
+    a := addr_absx(mem)
+    v := cpu_read(mem, a)
+    f := (mem[0x0926] & 0xFE) | (v & 1)
+    v = v >> 1
+    cpu_write(mem, a, v)
+    mem[0x0926] = f
+    set_nz(mem, v)
+    return 7
+  end
+  ; ROL mem
+  if op == 0x26
+    a := addr_zp(mem)
+    v := cpu_read(mem, a)
+    c := mem[0x0926] & 1
+    f := (mem[0x0926] & 0xFE) | (v >> 7)
+    v = ((v << 1) | c) & 0xFF
+    cpu_write(mem, a, v)
+    mem[0x0926] = f
+    set_nz(mem, v)
+    return 5
+  end
+  if op == 0x36
+    a := addr_zpx(mem)
+    v := cpu_read(mem, a)
+    c := mem[0x0926] & 1
+    f := (mem[0x0926] & 0xFE) | (v >> 7)
+    v = ((v << 1) | c) & 0xFF
+    cpu_write(mem, a, v)
+    mem[0x0926] = f
+    set_nz(mem, v)
+    return 6
+  end
+  if op == 0x2E
+    a := addr_abs(mem)
+    v := cpu_read(mem, a)
+    c := mem[0x0926] & 1
+    f := (mem[0x0926] & 0xFE) | (v >> 7)
+    v = ((v << 1) | c) & 0xFF
+    cpu_write(mem, a, v)
+    mem[0x0926] = f
+    set_nz(mem, v)
+    return 6
+  end
+  if op == 0x3E
+    a := addr_absx(mem)
+    v := cpu_read(mem, a)
+    c := mem[0x0926] & 1
+    f := (mem[0x0926] & 0xFE) | (v >> 7)
+    v = ((v << 1) | c) & 0xFF
+    cpu_write(mem, a, v)
+    mem[0x0926] = f
+    set_nz(mem, v)
+    return 7
+  end
+  ; ROR mem
+  if op == 0x66
+    a := addr_zp(mem)
+    v := cpu_read(mem, a)
+    c := mem[0x0926] & 1
+    f := (mem[0x0926] & 0xFE) | (v & 1)
+    v = (v >> 1) | (c << 7)
+    cpu_write(mem, a, v)
+    mem[0x0926] = f
+    set_nz(mem, v)
+    return 5
+  end
+  if op == 0x76
+    a := addr_zpx(mem)
+    v := cpu_read(mem, a)
+    c := mem[0x0926] & 1
+    f := (mem[0x0926] & 0xFE) | (v & 1)
+    v = (v >> 1) | (c << 7)
+    cpu_write(mem, a, v)
+    mem[0x0926] = f
+    set_nz(mem, v)
+    return 6
+  end
+  if op == 0x6E
+    a := addr_abs(mem)
+    v := cpu_read(mem, a)
+    c := mem[0x0926] & 1
+    f := (mem[0x0926] & 0xFE) | (v & 1)
+    v = (v >> 1) | (c << 7)
+    cpu_write(mem, a, v)
+    mem[0x0926] = f
+    set_nz(mem, v)
+    return 6
+  end
+  if op == 0x7E
+    a := addr_absx(mem)
+    v := cpu_read(mem, a)
+    c := mem[0x0926] & 1
+    f := (mem[0x0926] & 0xFE) | (v & 1)
+    v = (v >> 1) | (c << 7)
+    cpu_write(mem, a, v)
+    mem[0x0926] = f
+    set_nz(mem, v)
+    return 7
+  end
+  ; Unknown/unofficial NOP
+  return 2
+
+; === PPU Rendering ===
+fn render_scanline(mem: ptr, fb: ptr, scanline: u64)
+  if scanline >= 240
+    return
+  end
+  ctrl := mem[0x0930]
+  scroll_x := mem[0x0934]
+  scroll_y := mem[0x0935]
+  nt_base := 0
+  ; Nametable select from PPUCTRL bits 0-1
+  if ctrl & 1
+    nt_base = 256
+  end
+  ; Sprite 0 split: don't scroll above sprite 0's bottom edge
+  spr0_y := mem[0x0800] + 9
+  if scanline < spr0_y
+    scroll_x = 0
+    scroll_y = 0
+    nt_base = 0
+  end
+  bg_pt := (ctrl & 0x10) << 8
+  py := (scanline + scroll_y) & 0xFF
+  tile_row := py >> 3
+  fine_y := py & 7
+  px := 0
+  while px < 256
+    x_scroll := (px + scroll_x + nt_base) & 0x1FF
+    tile_col := (x_scroll >> 3) & 0x1F
+    fine_x := x_scroll & 7
+    nt_select := 0
+    if x_scroll >= 256
+      nt_select = 1
+    end
+    nt_addr := 0x2000 + (nt_select * 0x0400) + (tile_row & 0x1F) * 32 + tile_col
+    tile_idx := vram_read(mem, nt_addr)
+    pat_addr := bg_pt + tile_idx * 16 + fine_y
+    p0 := vram_read(mem, pat_addr)
+    p1 := vram_read(mem, pat_addr + 8)
+    bit := 7 - fine_x
+    b0 := (p0 >> bit) & 1
+    b1 := (p1 >> bit) & 1
+    color_idx := (b1 << 1) | b0
+    ; Attribute
+    pal_idx := 0
+    if color_idx != 0
+      attr_addr := 0x23C0 + (nt_select * 0x0400) + ((tile_row >> 2) * 8) + (tile_col >> 2)
+      attr := vram_read(mem, attr_addr)
+      shift := ((tile_row & 2) * 2) + (tile_col & 2)
+      pal_idx = ((attr >> shift) & 3) * 4 + color_idx
+    end
+    nes_color := mem[0x0900 + pal_idx] & 0x3F
+    rgb := nes_to_rgb(nes_color)
+    offset := (scanline * 256 + px) * 4
+    fb[offset] = rgb & 0xFF
+    fb[offset + 1] = (rgb >> 8) & 0xFF
+    fb[offset + 2] = (rgb >> 16) & 0xFF
+    fb[offset + 3] = 0xFF
+    px = px + 1
+  end
+  ; Sprites
+  render_sprites(mem, fb, scanline)
+  ; Sprite 0 hit detection
+  if (mem[0x0932] & 0x40) == 0
+    sy := mem[0x0800] + 1
+    if scanline >= sy
+      if scanline < sy + 8
+        mem[0x0932] = mem[0x0932] | 0x40
+      end
+    end
+  end
+  return
+
+fn render_sprites(mem: ptr, fb: ptr, scanline: u64)
+  ctrl := mem[0x0930]
+  spr_height := 8
+  if ctrl & 0x20
+    spr_height = 16
+  end
+  spr_pt := (ctrl & 0x08) << 9
+  i := 0
+  while i < 256
+    sy := mem[0x0800 + i]
+    tile := mem[0x0800 + i + 1]
+    attr := mem[0x0800 + i + 2]
+    sx := mem[0x0800 + i + 3]
+    sy = sy + 1
+    if scanline >= sy
+      if scanline < sy + spr_height
+        row := scanline - sy
+        if attr & 0x80
+          row = (spr_height - 1) - row
+        end
+        pat_addr := 0
+        if spr_height == 16
+          ; 8x16 mode: tile bit 0 selects pattern table
+          bank := (tile & 1) * 0x1000
+          tnum := tile & 0xFE
+          if row >= 8
+            tnum = tnum + 1
+            row = row - 8
+          end
+          pat_addr = bank + tnum * 16 + row
+        else
+          pat_addr = spr_pt + tile * 16 + row
+        end
+        p0 := vram_read(mem, pat_addr)
+        p1 := vram_read(mem, pat_addr + 8)
+        col := 0
+        while col < 8
+          bit := col
+          if (attr & 0x40) == 0
+            bit = 7 - col
+          end
+          b0 := (p0 >> bit) & 1
+          b1 := (p1 >> bit) & 1
+          cidx := (b1 << 1) | b0
+          if cidx != 0
+            pal := ((attr & 3) * 4 + cidx) + 16
+            nes_color := mem[0x0900 + pal] & 0x3F
+            rgb := nes_to_rgb(nes_color)
+            xpos := sx + col
+            if xpos < 256
+              offset := (scanline * 256 + xpos) * 4
+              fb[offset] = rgb & 0xFF
+              fb[offset + 1] = (rgb >> 8) & 0xFF
+              fb[offset + 2] = (rgb >> 16) & 0xFF
+              fb[offset + 3] = 0xFF
+            end
+          end
+          col = col + 1
+        end
+      end
+    end
+    i = i + 4
+  end
+  return
+
+fn do_nmi(mem: ptr)
+  push16(mem, get_pc(mem))
+  push8(mem, mem[0x0926])
+  lo := cpu_read(mem, 0xFFFA)
+  hi := cpu_read(mem, 0xFFFB)
+  set_pc(mem, (hi << 8) | lo)
+  mem[0x0926] = mem[0x0926] | 0x04
+  return
+
+; NES palette -> RGB (simplified)
+fn nes_to_rgb(idx: u64) -> u64
+  ; Standard NES palette (64 colors)
+  if idx == 0
+    return 0x757575
+  end
+  if idx == 1
+    return 0x271B8F
+  end
+  if idx == 2
+    return 0x0000AB
+  end
+  if idx == 3
+    return 0x47009F
+  end
+  if idx == 4
+    return 0x8F0077
+  end
+  if idx == 5
+    return 0xAB0013
+  end
+  if idx == 6
+    return 0xA70000
+  end
+  if idx == 7
+    return 0x7F0B00
+  end
+  if idx == 8
+    return 0x432F00
+  end
+  if idx == 9
+    return 0x004700
+  end
+  if idx == 10
+    return 0x005100
+  end
+  if idx == 11
+    return 0x003F17
+  end
+  if idx == 12
+    return 0x1B3F5F
+  end
+  if idx == 13
+    return 0x000000
+  end
+  if idx == 14
+    return 0x000000
+  end
+  if idx == 15
+    return 0x000000
+  end
+  if idx == 16
+    return 0xBCBCBC
+  end
+  if idx == 17
+    return 0x0073EF
+  end
+  if idx == 18
+    return 0x233BEF
+  end
+  if idx == 19
+    return 0x8300F3
+  end
+  if idx == 20
+    return 0xBF00BF
+  end
+  if idx == 21
+    return 0xE7005B
+  end
+  if idx == 22
+    return 0xDB2B00
+  end
+  if idx == 23
+    return 0xCB4F0F
+  end
+  if idx == 24
+    return 0x8B7300
+  end
+  if idx == 25
+    return 0x009700
+  end
+  if idx == 26
+    return 0x00AB00
+  end
+  if idx == 27
+    return 0x00933B
+  end
+  if idx == 28
+    return 0x00838B
+  end
+  if idx == 29
+    return 0x000000
+  end
+  if idx == 30
+    return 0x000000
+  end
+  if idx == 31
+    return 0x000000
+  end
+  if idx == 32
+    return 0xFFFFFF
+  end
+  if idx == 33
+    return 0x3FBFFF
+  end
+  if idx == 34
+    return 0x5F97FF
+  end
+  if idx == 35
+    return 0xA78BFD
+  end
+  if idx == 36
+    return 0xF77BFF
+  end
+  if idx == 37
+    return 0xFF77B7
+  end
+  if idx == 38
+    return 0xFF7763
+  end
+  if idx == 39
+    return 0xFF9B3B
+  end
+  if idx == 40
+    return 0xF3BF3F
+  end
+  if idx == 41
+    return 0x83D313
+  end
+  if idx == 42
+    return 0x4FDF4B
+  end
+  if idx == 43
+    return 0x58F898
+  end
+  if idx == 44
+    return 0x00EBDB
+  end
+  if idx == 45
+    return 0x000000
+  end
+  if idx == 46
+    return 0x000000
+  end
+  if idx == 47
+    return 0x000000
+  end
+  if idx == 48
+    return 0xFFFFFF
+  end
+  if idx == 49
+    return 0xABE7FF
+  end
+  if idx == 50
+    return 0xC7D7FF
+  end
+  if idx == 51
+    return 0xD7CBFF
+  end
+  if idx == 52
+    return 0xFFC7FF
+  end
+  if idx == 53
+    return 0xFFC7DB
+  end
+  if idx == 54
+    return 0xFFBFB3
+  end
+  if idx == 55
+    return 0xFFDBAB
+  end
+  if idx == 56
+    return 0xFFE7A3
+  end
+  if idx == 57
+    return 0xE3FFA3
+  end
+  if idx == 58
+    return 0xABF3BF
+  end
+  if idx == 59
+    return 0xB3FFCF
+  end
+  if idx == 60
+    return 0x9FFFF3
+  end
+  if idx == 61
+    return 0x000000
+  end
+  if idx == 62
+    return 0x000000
+  end
+  if idx == 63
+    return 0x000000
+  end
+  return 0x000000
+
+; === APU ===
+; APU state stored at mem offsets 0x0970-0x09FF
+; 0x0970: sq1 period lo
+; 0x0971: sq1 period hi (3 bits)
+; 0x0972: sq1 volume
+; 0x0973: sq1 duty
+; 0x0974: sq1 enabled
+; 0x0978: sq2 period lo
+; 0x0979: sq2 period hi
+; 0x097A: sq2 volume
+; 0x097B: sq2 duty
+; 0x097C: sq2 enabled
+; 0x0980: tri period lo
+; 0x0981: tri period hi
+; 0x0982: tri enabled
+; 0x0990: apu_phase_sq1 (4 bytes as u32)
+; 0x0994: apu_phase_sq2 (4 bytes)
+; 0x0998: apu_phase_tri (4 bytes)
+
+; Global pointer for audio callback to access NES memory
+
+fn apu_write(mem: ptr, addr: u64, val: u64)
+  ; $4000-$4003: Square 1
+  if addr == 0x4000
+    mem[0x0973] = (val >> 6) & 3
+    mem[0x0972] = val & 0x0F
+    mem[0x0976] = (val >> 5) & 1
+    mem[0x0977] = (val >> 4) & 1
+    mem[0x09D0] = 0
+    return
+  end
+  if addr == 0x4002
+    mem[0x0970] = val
+    mem[0x09D0] = 0
+    return
+  end
+  ; $4001: Sweep (enabled, period, negate, shift)
+  if addr == 0x4001
+    mem[0x09A0] = val
+    return
+  end
+  if addr == 0x4003
+    mem[0x0971] = val & 7
+    mem[0x0975] = (val >> 3) * 2
+    mem[0x0974] = 1
+    mem[0x09D0] = 0
+    return
+  end
+  ; $4004-$4007: Square 2
+  if addr == 0x4004
+    mem[0x097B] = (val >> 6) & 3
+    mem[0x097A] = val & 0x0F
+    mem[0x097E] = (val >> 5) & 1
+    mem[0x09D1] = 0
+    return
+  end
+  if addr == 0x4006
+    mem[0x0978] = val
+    mem[0x09D1] = 0
+    return
+  end
+  if addr == 0x4007
+    mem[0x0979] = val & 7
+    mem[0x097D] = (val >> 3) * 2
+    mem[0x097C] = 1
+    mem[0x09D1] = 0
+    return
+  end
+  ; $4008-$400B: Triangle
+  if addr == 0x4008
+    mem[0x0983] = val & 0x7F
+    return
+  end
+  if addr == 0x400A
+    mem[0x0980] = val
+    mem[0x09D2] = 0
+    return
+  end
+  if addr == 0x400B
+    mem[0x0981] = val & 7
+    mem[0x0984] = mem[0x0983]
+    mem[0x0982] = 1
+    mem[0x09D2] = 0
+    return
+  end
+  ; $4015: Status
+  if addr == 0x4015
+    mem[0x0974] = val & 1
+    mem[0x097C] = (val >> 1) & 1
+    mem[0x0982] = (val >> 2) & 1
+    ; Reset phases for disabled channels
+    if (val & 1) == 0
+      mem[0x0990] = 0
+      mem[0x0991] = 0
+      mem[0x0992] = 0
+      mem[0x0993] = 0
+    end
+    if (val & 2) == 0
+      mem[0x0994] = 0
+      mem[0x0995] = 0
+      mem[0x0996] = 0
+      mem[0x0997] = 0
+    end
+    return
+  end
+  return
+
+fn audio_callback(mem_ptr: ptr, stream: ptr, len: u64)
+  mem := mem_ptr
+  sq1_period := mem[0x0970] | (mem[0x0971] << 8)
+  sq2_period := mem[0x0978] | (mem[0x0979] << 8)
+  tri_period := mem[0x0980] | (mem[0x0981] << 8)
+  ; Read phases (stored as 32-bit values in fixed-point 16.16)
+  sq1_phase := mem[0x0990] | (mem[0x0991] << 8) | (mem[0x0992] << 16) | (mem[0x0993] << 24)
+  sq2_phase := mem[0x0994] | (mem[0x0995] << 8) | (mem[0x0996] << 16) | (mem[0x0997] << 24)
+  tri_phase := mem[0x0998] | (mem[0x0999] << 8) | (mem[0x099A] << 16) | (mem[0x099B] << 24)
+  ; Phase increment: how much phase advances per sample
+  ; NES square freq = 1789773 / (16 * (period + 1))
+  ; Samples per full wave = sample_rate / freq = 44100 * 16 * (period+1) / 1789773
+  ; Phase is 0..samples_per_wave, we use fixed point * 65536
+  ; inc = 65536 / samples_per_wave = 65536 * 1789773 / (44100 * 16 * (period+1))
+  ;     = 65536 * 111861 / (44100 * (period+1))  [dividing num and denom by 16]
+  ;     simplify: 111861 * 65536 / (44100 * (period+1))
+  ;     = 7330529296 / (44100 * (period+1))
+  ; For triangle: freq = 1789773 / (32 * (period+1))
+  ;     inc = 65536 * 1789773 / (44100 * 32 * (period+1))
+  i := 0
+  while i < len
+    sample := 128
+    ; Square 1
+    if mem[0x0974]
+      if sq1_period > 8
+        sq1_inc := 7330529296 / (44100 * (sq1_period + 1))
+        sq1_phase = sq1_phase + sq1_inc
+        ; pos in 0..7 for duty cycle (top 3 bits of 16-bit phase)
+        pos := (sq1_phase >> 13) & 7
+        duty := mem[0x0973]
+        on := 0
+        if duty == 0
+          if pos == 1
+            on = 1
+          end
+        end
+        if duty == 1
+          if pos < 2
+            on = 1
+          end
+        end
+        if duty == 2
+          if pos < 4
+            on = 1
+          end
+        end
+        if duty == 3
+          if pos >= 2
+            on = 1
+          end
+        end
+        vol := mem[0x0972]
+        if on
+          sample = sample + vol * 3
+        else
+          sample = sample - vol * 3
+        end
+      end
+    end
+    ; Square 2
+    if mem[0x097C]
+      if sq2_period > 8
+        sq2_inc := 7330529296 / (44100 * (sq2_period + 1))
+        sq2_phase = sq2_phase + sq2_inc
+        pos := (sq2_phase >> 13) & 7
+        duty := mem[0x097B]
+        on := 0
+        if duty == 0
+          if pos == 1
+            on = 1
+          end
+        end
+        if duty == 1
+          if pos < 2
+            on = 1
+          end
+        end
+        if duty == 2
+          if pos < 4
+            on = 1
+          end
+        end
+        if duty == 3
+          if pos >= 2
+            on = 1
+          end
+        end
+        vol := mem[0x097A]
+        if on
+          sample = sample + vol * 3
+        else
+          sample = sample - vol * 3
+        end
+      end
+    end
+    ; Triangle
+    if mem[0x0982]
+      if tri_period > 2
+        if tri_period < 0x7FF
+          tri_inc := 3665264648 / (44100 * (tri_period + 1))
+          tri_phase = tri_phase + tri_inc
+          ; 32 steps in triangle wave
+          pos := (tri_phase >> 11) & 31
+          tv := 0
+          if pos < 16
+            tv = pos
+          else
+            tv = 31 - pos
+          end
+          sample = sample + tv - 8
+        end
+      end
+    end
+    ; Clamp
+    if sample > 240
+      sample = 240
+    end
+    if sample < 16
+      sample = 16
+    end
+    stream[i] = sample
+    i = i + 1
+  end
+  ; Store phases back
+  mem[0x0990] = sq1_phase & 0xFF
+  mem[0x0991] = (sq1_phase >> 8) & 0xFF
+  mem[0x0992] = (sq1_phase >> 16) & 0xFF
+  mem[0x0993] = (sq1_phase >> 24) & 0xFF
+  mem[0x0994] = sq2_phase & 0xFF
+  mem[0x0995] = (sq2_phase >> 8) & 0xFF
+  mem[0x0996] = (sq2_phase >> 16) & 0xFF
+  mem[0x0997] = (sq2_phase >> 24) & 0xFF
+  mem[0x0998] = tri_phase & 0xFF
+  mem[0x0999] = (tri_phase >> 8) & 0xFF
+  mem[0x099A] = (tri_phase >> 16) & 0xFF
+  mem[0x099B] = (tri_phase >> 24) & 0xFF
+  return
+
+; === Mapper ===
+fn mmc1_read(mem: ptr, addr: u64) -> u64
+  ctrl := mem[0x09B2]
+  bank := mem[0x09B5]
+  prg_banks := mem[0x0950]
+  mode := (ctrl >> 2) & 3
+  if mode < 2
+    ; 32K mode
+    b := (bank & 0x0E) * 16384
+    off := addr - 0x8000
+    return mem[0x10000 + b + off]
+  end
+  if mode == 2
+    ; Fix first, switch second
+    if addr < 0xC000
+      off := addr - 0x8000
+      return mem[0x10000 + off]
+    end
+    b := bank * 16384
+    off := addr - 0xC000
+    return mem[0x10000 + b + off]
+  end
+  ; mode 3: switch first, fix last
+  if addr < 0xC000
+    b := bank * 16384
+    off := addr - 0x8000
+    return mem[0x10000 + b + off]
+  end
+  last := (prg_banks - 1) * 16384
+  off := addr - 0xC000
+  return mem[0x10000 + last + off]
+
+fn mmc3_read(mem: ptr, addr: u64) -> u64
+  prg_banks := mem[0x0950]
+  sel := mem[0x09C0]
+  p0 := mem[0x09B6 + 6]
+  p1 := mem[0x09B6 + 7]
+  last := (prg_banks * 2) - 1
+  second_last := last - 1
+  ; Each PRG bank is 8KB
+  if addr < 0xA000
+    if sel & 0x40
+      return mem[0x10000 + second_last * 8192 + (addr - 0x8000)]
+    else
+      return mem[0x10000 + p0 * 8192 + (addr - 0x8000)]
+    end
+  end
+  if addr < 0xC000
+    return mem[0x10000 + p1 * 8192 + (addr - 0xA000)]
+  end
+  if addr < 0xE000
+    if sel & 0x40
+      return mem[0x10000 + p0 * 8192 + (addr - 0xC000)]
+    else
+      return mem[0x10000 + second_last * 8192 + (addr - 0xC000)]
+    end
+  end
+  return mem[0x10000 + last * 8192 + (addr - 0xE000)]
+
+fn mapper_write(mem: ptr, addr: u64, val: u64)
+  mapper := mem[0x0968]
+  if mapper == 0
+    return
+  end
+  if mapper == 1
+    mmc1_write(mem, addr, val)
+    return
+  end
+  if mapper == 4
+    mmc3_write(mem, addr, val)
+    return
+  end
+  return
+
+fn mmc1_write(mem: ptr, addr: u64, val: u64)
+  ; Reset if bit 7 set
+  if val & 0x80
+    mem[0x09B0] = 0
+    mem[0x09B1] = 0
+    mem[0x09B2] = mem[0x09B2] | 0x0C
+    return
+  end
+  ; Shift register: 5 writes to fill
+  sr := mem[0x09B0]
+  cnt := mem[0x09B1]
+  sr = sr | ((val & 1) << cnt)
+  cnt = cnt + 1
+  if cnt < 5
+    mem[0x09B0] = sr
+    mem[0x09B1] = cnt
+    return
+  end
+  ; 5th write: apply register based on address
+  mem[0x09B0] = 0
+  mem[0x09B1] = 0
+  if addr < 0xA000
+    ; Control register
+    mem[0x09B2] = sr
+    mirror := sr & 3
+    if mirror == 0
+      mem[0x0960] = 2
+    end
+    if mirror == 1
+      mem[0x0960] = 3
+    end
+    if mirror == 2
+      mem[0x0960] = 1
+    end
+    if mirror == 3
+      mem[0x0960] = 0
+    end
+    return
+  end
+  if addr < 0xC000
+    ; CHR bank 0
+    mem[0x09B3] = sr
+    mmc1_update_chr(mem)
+    return
+  end
+  if addr < 0xE000
+    ; CHR bank 1
+    mem[0x09B4] = sr
+    mmc1_update_chr(mem)
+    return
+  end
+  ; PRG bank
+  mem[0x09B5] = sr & 0x0F
+  mmc1_update_prg(mem)
+  return
+
+fn mmc1_update_prg(mem: ptr)
+  ; No-op: reads are resolved on the fly now
+  return
+
+fn mmc1_update_chr(mem: ptr)
+  ctrl := mem[0x09B2]
+  chr_banks := mem[0x0958]
+  if chr_banks == 0
+    return
+  end
+  if ctrl & 0x10
+    ; 4K mode
+    b0 := mem[0x09B3] * 4096
+    memcpy(mem + 0xA000, mem + 0x60000 + b0, 4096)
+    b1 := mem[0x09B4] * 4096
+    memcpy(mem + 0xB000, mem + 0x60000 + b1, 4096)
+  else
+    ; 8K mode
+    b0 := (mem[0x09B3] & 0x1E) * 4096
+    memcpy(mem + 0xA000, mem + 0x60000 + b0, 8192)
+  end
+  return
+
+fn mmc3_write(mem: ptr, addr: u64, val: u64)
+  if addr < 0xA000
+    if (addr & 1) == 0
+      ; Bank select
+      mem[0x09C0] = val
+    else
+      ; Bank data
+      reg := mem[0x09C0] & 7
+      mem[0x09B6 + reg] = val
+      mmc3_update_banks(mem)
+    end
+    return
+  end
+  if addr < 0xC000
+    if (addr & 1) == 0
+      ; Mirroring
+      if val & 1
+        mem[0x0960] = 0
+      else
+        mem[0x0960] = 1
+      end
+    end
+    return
+  end
+  return
+
+fn mmc3_update_banks(mem: ptr)
+  chr_banks := mem[0x0958]
+  sel := mem[0x09C0]
+  ; CHR banking only (PRG resolved on read)
+  if chr_banks > 0
+    if sel & 0x80
+      memcpy(mem + 0xA000, mem + 0x60000 + mem[0x09B6 + 2] * 1024, 1024)
+      memcpy(mem + 0xA400, mem + 0x60000 + mem[0x09B6 + 3] * 1024, 1024)
+      memcpy(mem + 0xA800, mem + 0x60000 + mem[0x09B6 + 4] * 1024, 1024)
+      memcpy(mem + 0xAC00, mem + 0x60000 + mem[0x09B6 + 5] * 1024, 1024)
+      c0 := (mem[0x09B6] & 0xFE) * 1024
+      memcpy(mem + 0xB000, mem + 0x60000 + c0, 2048)
+      c1 := (mem[0x09B6 + 1] & 0xFE) * 1024
+      memcpy(mem + 0xB800, mem + 0x60000 + c1, 2048)
+    else
+      c0 := (mem[0x09B6] & 0xFE) * 1024
+      memcpy(mem + 0xA000, mem + 0x60000 + c0, 2048)
+      c1 := (mem[0x09B6 + 1] & 0xFE) * 1024
+      memcpy(mem + 0xA800, mem + 0x60000 + c1, 2048)
+      memcpy(mem + 0xB000, mem + 0x60000 + mem[0x09B6 + 2] * 1024, 1024)
+      memcpy(mem + 0xB400, mem + 0x60000 + mem[0x09B6 + 3] * 1024, 1024)
+      memcpy(mem + 0xB800, mem + 0x60000 + mem[0x09B6 + 4] * 1024, 1024)
+      memcpy(mem + 0xBC00, mem + 0x60000 + mem[0x09B6 + 5] * 1024, 1024)
+    end
+  end
+  return
+
+; === ROM Loading ===
+fn load_rom(mem: ptr, path: ptr) -> u64
+  fd := open(path, 0, 0)
+  if fd < 0
+    return 0
+  end
+  hdr := malloc(16)
+  read(fd, hdr, 16)
+  prg_banks := hdr[4]
+  chr_banks := hdr[5]
+  flags6 := hdr[6]
+  flags7 := hdr[7]
+  mem[0x0950] = prg_banks
+  mem[0x0958] = chr_banks
+  mem[0x0960] = flags6 & 1
+  mem[0x0968] = ((flags6 >> 4) & 0x0F) | (flags7 & 0xF0)
+  ; Skip trainer if present
+  if flags6 & 4
+    lseek(fd, 512, 1)
+  end
+  ; Read PRG ROM to 0x10000
+  prg_size := prg_banks * 16384
+  prg_dest := mem + 0x10000
+  read(fd, prg_dest, prg_size)
+  ; Read CHR ROM to 0x60000
+  if chr_banks > 0
+    chr_size := chr_banks * 8192
+    chr_dest := mem + 0x60000
+    read(fd, chr_dest, chr_size)
+    ; Copy first 8K CHR to PPU pattern tables
+    memcpy(mem + 0xA000, chr_dest, 8192)
+  end
+  ; Init mapper state
+  mem[0x09B2] = 0x0C
+  close(fd)
+  free(hdr)
+  return 1
+
+; === Input ===
+fn update_input(mem: ptr, keys: ptr)
+  pad := 0
+  ; A = Z (scancode 29)
+  if keys[29]
+    pad = pad | 0x01
+  end
+  ; B = X (scancode 27)
+  if keys[27]
+    pad = pad | 0x02
+  end
+  ; Select = RShift (scancode 229)
+  if keys[229]
+    pad = pad | 0x04
+  end
+  ; Start = Return (scancode 40)
+  if keys[40]
+    pad = pad | 0x08
+  end
+  ; Up (scancode 82)
+  if keys[82]
+    pad = pad | 0x10
+  end
+  ; Down (scancode 81)
+  if keys[81]
+    pad = pad | 0x20
+  end
+  ; Left (scancode 80)
+  if keys[80]
+    pad = pad | 0x40
+  end
+  ; Right (scancode 79)
+  if keys[79]
+    pad = pad | 0x80
+  end
+  mem[0x0940] = pad
+  return
+
+; === Main ===
+fn get_argv(argv: ptr, idx: u64) -> ptr
+  ; argv is char** so each entry is a pointer (8 bytes apart)
+  base := argv + (idx * 8)
+  lo := base[0] | (base[1] << 8) | (base[2] << 16) | (base[3] << 24)
+  hi := base[4] | (base[5] << 8) | (base[6] << 16) | (base[7] << 24)
+  return lo | (hi * 4294967296)
+
+fn main(argc: u64, argv: ptr)
+  ; Allocate NES memory (512KB for mapper support)
+  mem := malloc(524288)
+  memset(mem, 0, 524288)
+  ; Allocate framebuffer (256*240*4)
+  fb := malloc(245760)
+  memset(fb, 0, 245760)
+  ; Load ROM
+  path := "Super Mario Bros. (World).nes\x00"
+  if argc > 1
+    path = get_argv(argv, 1)
+  end
+  ok := load_rom(mem, path)
+  if ok == 0
+    printf("Failed to load ROM\n")
+    exit(1)
+  end
+  ; Init CPU
+  mem[0x0925] = 0xFD
+  mem[0x0926] = 0x24
+  lo := cpu_read(mem, 0xFFFC)
+  hi := cpu_read(mem, 0xFFFD)
+  set_pc(mem, (hi << 8) | lo)
+  ; Init SDL
+  SDL_Init(0x30)
+  ; Audio setup with SDL_QueueAudio (no callback)
+  aspec := malloc(32)
+  memset(aspec, 0, 32)
+  ; freq = 44100
+  aspec[0] = 68
+  aspec[1] = 172
+  aspec[2] = 0
+  aspec[3] = 0
+  ; format = AUDIO_U8 = 0x0008
+  aspec[4] = 8
+  aspec[5] = 0
+  ; channels = 1
+  aspec[6] = 1
+  ; samples = 2048 = 0x0800
+  aspec[8] = 0
+  aspec[9] = 8
+  audio_dev := SDL_OpenAudioDevice(0, 0, aspec, 0, 0)
+  SDL_PauseAudioDevice(audio_dev, 0)
+  audio_buf := malloc(735)
+  win := SDL_CreateWindow("NES\x00", 100, 100, 512, 480, 4)
+  ren := SDL_CreateRenderer(win, -1, 0)
+  tex := SDL_CreateTexture(ren, 0x16362004, 1, 256, 240)
+  ; Allocate framebuffer
+  event := malloc(64)
+  running := 1
+  while running
+    ; Poll events
+    while SDL_PollEvent(event)
+      etype := event[0] | (event[1] << 8) | (event[2] << 16) | (event[3] << 24)
+      if etype == 0x100
+        running = 0
+      end
+    end
+    ; Input
+    keys := SDL_GetKeyboardState(0)
+    update_input(mem, keys)
+    ; Run one frame: 262 scanlines
+    scanline := 0
+    while scanline < 262
+      ; Run CPU for one scanline (~113 cycles)
+      cyc := 0
+      while cyc < 113
+        step := cpu_step(mem)
+        if step == 0
+          step = 1
+        end
+        cyc = cyc + step
+      end
+      ; Render visible scanlines
+      if scanline < 240
+        render_scanline(mem, fb, scanline)
+      end
+      ; Vblank start
+      if scanline == 241
+        mem[0x0932] = mem[0x0932] | 0x80
+        if mem[0x0930] & 0x80
+          do_nmi(mem)
+        end
+        ; APU length counters (decrement, silence when 0)
+        if mem[0x0975] > 0
+          mem[0x0975] = mem[0x0975] - 1
+          if mem[0x0975] == 0
+            if mem[0x0976] == 0
+              mem[0x0974] = 0
+            end
+          end
+        end
+        if mem[0x097D] > 0
+          mem[0x097D] = mem[0x097D] - 1
+          if mem[0x097D] == 0
+            if mem[0x097E] == 0
+              mem[0x097C] = 0
+            end
+          end
+        end
+        ; Envelope decay (volume fades out over time)
+        if mem[0x0977] == 0
+          if mem[0x0972] > 0
+            mem[0x0972] = mem[0x0972] - 1
+          else
+            mem[0x0974] = 0
+          end
+        end
+        if mem[0x097A] > 0
+          if mem[0x097E] == 0
+            mem[0x097A] = mem[0x097A] - 1
+          end
+        end
+        ; Triangle linear counter
+        if mem[0x0984] > 0
+          mem[0x0984] = mem[0x0984] - 1
+          if mem[0x0984] == 0
+            mem[0x0982] = 0
+          end
+        end
+        ; Hard timeout: silence channels after ~1 second
+        mem[0x09D0] = mem[0x09D0] + 1
+        if mem[0x09D0] > 60
+          mem[0x0974] = 0
+        end
+        mem[0x09D1] = mem[0x09D1] + 1
+        if mem[0x09D1] > 60
+          mem[0x097C] = 0
+        end
+        mem[0x09D2] = mem[0x09D2] + 1
+        if mem[0x09D2] > 60
+          mem[0x0982] = 0
+        end
+        ; Sweep for square 1
+        sweep := mem[0x09A0]
+        if sweep & 0x80
+          sq1p := mem[0x0970] | (mem[0x0971] << 8)
+          shift := sweep & 7
+          delta := sq1p >> shift
+          if sweep & 8
+            sq1p = sq1p - delta
+          else
+            sq1p = sq1p + delta
+          end
+          if sq1p > 0x7FF
+            mem[0x0974] = 0
+          else
+            mem[0x0970] = sq1p & 0xFF
+            mem[0x0971] = (sq1p >> 8) & 7
+          end
+        end
+      end
+      ; Vblank end / pre-render
+      if scanline == 261
+        mem[0x0932] = 0
+        mem[0x0933] = 0
+      end
+      scanline = scanline + 1
+    end
+    ; Generate audio for this frame (735 samples at 44100Hz / 60fps)
+    audio_callback(mem, audio_buf, 735)
+    SDL_QueueAudio(audio_dev, audio_buf, 735)
+    ; Update texture and render
+    SDL_UpdateTexture(tex, 0, fb, 1024)
+    SDL_RenderClear(ren)
+    SDL_RenderCopy(ren, tex, 0, 0)
+    SDL_RenderPresent(ren)
+    SDL_Delay(16)
+  end
+  ; Cleanup
+  SDL_DestroyTexture(tex)
+  SDL_DestroyRenderer(ren)
+  SDL_DestroyWindow(win)
+  SDL_Quit()
+  free(mem)
+  free(fb)
+  free(event)
+  exit(0)

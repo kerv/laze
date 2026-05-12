@@ -1,0 +1,9 @@
+*.nes
+*.o
+*.app
+hello
+nes
+test_*
+__pycache__/
+.DS_Store
+/tmp/
